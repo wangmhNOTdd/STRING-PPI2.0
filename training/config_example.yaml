@@ -1,0 +1,41 @@
+# Example configuration for link prediction training
+# Copy this file and adjust values per experiment
+
+seed: 42
+
+# Dataset settings
+dataset: SHS27k            # One of [SHS27k, SHS148k, STRING]
+split: bfs                 # One of [bfs, dfs, random]
+edge_mode: index           # 'index' if ppi.pkl stores integer indices; 'id' if protein IDs
+emb_type: ragplm           # Currently only ragplm implemented
+
+# Paths (relative to project root)
+processed_dir: processed_data
+emb_dir: feature_extraction
+output_dir: runs
+
+# Model architecture
+model:
+  encoder: graphsage       # future extension: other GNNs
+  hidden_dim: 512
+  sage_layers: 2
+  dropout: 0.2
+  link_hidden: 256         # hidden dim inside link predictor MLP
+
+# Optimization
+optim:
+  lr: 0.001
+  epochs: 50
+  batch_size: 8192
+  patience: 10
+
+# Training options
+train:
+  inductive: true          # If true, graph built only from train edges
+  use_val_in_graph: false  # If true and inductive=true, add val edges to graph structure only
+  metric: auc              # early stopping metric: auc or f1
+
+# Logging/saving
+logging:
+  save_best_only: true
+  verbose_every: 1
