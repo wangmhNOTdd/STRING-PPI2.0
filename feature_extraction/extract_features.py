@@ -1,6 +1,6 @@
 import torch
 import pandas as pd
-from transformers import T5Tokenizer, T5EncoderModel
+from transformers import AutoTokenizer, T5EncoderModel
 import numpy as np
 import os
 import re
@@ -67,17 +67,8 @@ def main():
     print(f"Using device: {device}")
 
     # Load tokenizer and model
-    tokenizer = T5Tokenizer.from_pretrained(
-        model_name, 
-        do_lower_case=False,
-        force_download=True,
-        ignore_mismatched_sizes=True
-    )
-    model = T5EncoderModel.from_pretrained(
-        model_name,
-        force_download=True,
-        ignore_mismatched_sizes=True
-    ).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, do_lower_case=False)
+    model = T5EncoderModel.from_pretrained(model_name).to(device)
     model.eval() # Set model to evaluation mode
 
     # --- Feature Extraction Loop ---
