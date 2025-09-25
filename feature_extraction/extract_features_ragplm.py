@@ -43,6 +43,26 @@ from typing import List
 import torch
 import numpy as np
 import pandas as pd
+import inspect
+
+# ---------------- PyTorch compatibility patch ---------------- #
+# Some environments have an older torch where scaled_dot_product_attention
+# does not accept 'enable_gqa'. The fm4bio backbone passes this arg, so we
+# inject a shim if necessary.
+try:
+    import torch.nn.functional as F
+    if 'enable_gqa' not in inspect.signature(F.scaled_dot_product_attention).parameters:  # type: ignore[attr-defined]
+        _orig_sdp = F.scaled_dot_product_attention
+        def _compat_sdp(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False):  # noqa: D401
+            return _orig_sdp(query, key, value,
+                             attn_mask=attn_mask,
+                             dropout_p=dropout_p,
+                             is_causal=is_causal,
+                             scale=scale)
+        F.scaled_dot_product_attention = _compat_sdp  # type: ignore
+        print("[Compat] Patched torch.nn.functional.scaled_dot_product_attention to ignore 'enable_gqa'.")
+except Exception as _patch_err:  # pragma: no cover
+    print(f"[Compat] Failed to patch scaled_dot_product_attention: {_patch_err}")
 
 try:
     from modelgenerator.tasks import Embed
@@ -61,6 +81,7 @@ ALLOW_TRUNCATION = True          # If sequence > MAX_LENGTH, truncate tail
 BATCH_MODE = False               # Set True to batch multiple sequences (experimental)
 BATCH_SIZE = 2                   # Used only if BATCH_MODE is True
 FP16 = True                      # Try half precision to save memory
+SAVE_TOKEN_LEVEL = True          # Save token-level embeddings (variable length) per sequence
 SEED = 42
 
 random.seed(SEED)
@@ -118,6 +139,10 @@ def load_model(device: torch.device):
     return model
 
 
+def _sanitize_id(pid: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", pid)[:100]
+
+
 def process_dataset(name: str, model, device: torch.device):
     input_csv = os.path.join(DATA_DIR, f"protein.{name}.sequences.dictionary.csv")
     emb_path = os.path.join(OUTPUT_DIR, f"{name}_ragplm_embeddings.npy")
@@ -138,6 +163,11 @@ def process_dataset(name: str, model, device: torch.device):
 
     all_vecs = []
     start_time = time.time()
+
+    token_dir = None
+    if SAVE_TOKEN_LEVEL:
+        token_dir = os.path.join(OUTPUT_DIR, f"{name}_token_embeddings")
+        os.makedirs(token_dir, exist_ok=True)
 
     if BATCH_MODE:
         logger.info(f"Batch mode enabled (batch_size={BATCH_SIZE})")
@@ -170,9 +200,15 @@ def process_dataset(name: str, model, device: torch.device):
             data['str_emb'] = np.zeros((len(cleaned_batch), max_len_in_batch, 384), dtype=np.float32)
             transformed = model.transform(data)
             with torch.no_grad():
-                out = model(transformed)
-            out = mean_pool_embedding(out)
-            all_vecs.append(out.cpu().float())
+                out = model(transformed)  # (B, L, H)
+            if SAVE_TOKEN_LEVEL and token_dir is not None:
+                # Save each sequence token embedding separately
+                for local_idx, seq in enumerate(cleaned_batch):
+                    pid = batch_ids[local_idx]
+                    token_emb = out[local_idx, :len(seq)].detach().cpu().float().numpy()
+                    np.save(os.path.join(token_dir, f"{_sanitize_id(pid)}.npy"), token_emb)
+            pooled = mean_pool_embedding(out)
+            all_vecs.append(pooled.cpu().float())
             logger.info(f"Processed batch {i//BATCH_SIZE + 1}/{math.ceil(len(sequences)/BATCH_SIZE)}")
     else:
         for idx, (pid, seq) in enumerate(zip(protein_ids, sequences), start=1):
@@ -189,9 +225,12 @@ def process_dataset(name: str, model, device: torch.device):
             }
             transformed = model.transform(data)
             with torch.no_grad():
-                out = model(transformed)
-            out = mean_pool_embedding(out)  # shape (1, H)
-            all_vecs.append(out.cpu().float())
+                out = model(transformed)  # (1, L, H)
+            if SAVE_TOKEN_LEVEL and token_dir is not None:
+                token_emb = out[0, :len(seq)].detach().cpu().float().numpy()
+                np.save(os.path.join(token_dir, f"{_sanitize_id(pid)}.npy"), token_emb)
+            pooled = mean_pool_embedding(out)  # shape (1, H)
+            all_vecs.append(pooled.cpu().float())
             if idx % 100 == 0:
                 elapsed = time.time() - start_time
                 logger.info(f"  {idx}/{len(sequences)} sequences done ({elapsed/60:.1f} min)")
