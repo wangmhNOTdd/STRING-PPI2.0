@@ -43,26 +43,27 @@ from typing import List
 import torch
 import numpy as np
 import pandas as pd
-import inspect
+import inspect  # still imported in case future logic needs it
 
-# ---------------- PyTorch compatibility patch ---------------- #
-# Some environments have an older torch where scaled_dot_product_attention
-# does not accept 'enable_gqa'. The fm4bio backbone passes this arg, so we
-# inject a shim if necessary.
+# ---------------- PyTorch compatibility patch (robust) ---------------- #
+# Root cause: modelgenerator's fm4bio code calls F.scaled_dot_product_attention(..., enable_gqa=False)
+# but older torch versions (<2.3) do not accept this kwarg, causing TypeError.
+# Previous attempt relied on inspect.signature which can fail for some builtin kernels.
+# New approach: unconditionally wrap the function so that 'enable_gqa' is stripped.
 try:
     import torch.nn.functional as F
-    if 'enable_gqa' not in inspect.signature(F.scaled_dot_product_attention).parameters:  # type: ignore[attr-defined]
-        _orig_sdp = F.scaled_dot_product_attention
-        def _compat_sdp(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False):  # noqa: D401
-            return _orig_sdp(query, key, value,
-                             attn_mask=attn_mask,
-                             dropout_p=dropout_p,
-                             is_causal=is_causal,
-                             scale=scale)
-        F.scaled_dot_product_attention = _compat_sdp  # type: ignore
-        print("[Compat] Patched torch.nn.functional.scaled_dot_product_attention to ignore 'enable_gqa'.")
-except Exception as _patch_err:  # pragma: no cover
-    print(f"[Compat] Failed to patch scaled_dot_product_attention: {_patch_err}")
+    _orig_sdp = F.scaled_dot_product_attention
+    def _wrapped_sdp(query, key, value, *args, **kwargs):
+        # Silently discard unsupported kwarg
+        if 'enable_gqa' in kwargs:
+            kwargs.pop('enable_gqa', None)
+        return _orig_sdp(query, key, value, *args, **kwargs)
+    # Avoid double-wrapping (id check)
+    if getattr(F.scaled_dot_product_attention, '__name__', '') != '_wrapped_sdp':
+        F.scaled_dot_product_attention = _wrapped_sdp  # type: ignore
+        print('[Compat] Wrapped scaled_dot_product_attention (strips enable_gqa).')
+except Exception as _e:  # pragma: no cover
+    print(f'[Compat] Could not wrap scaled_dot_product_attention: {_e}')
 
 try:
     from modelgenerator.tasks import Embed
