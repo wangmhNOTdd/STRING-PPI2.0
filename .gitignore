@@ -1,0 +1,19 @@
+# Ignore processed data (per user request)
+processed_data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Environment
+.env
+env/
+venv/
+
+# IDEs
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
