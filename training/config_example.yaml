@@ -34,6 +34,8 @@ train:
   inductive: true          # If true, graph built only from train edges
   use_val_in_graph: false  # If true and inductive=true, add val edges to graph structure only
   metric: auc              # early stopping metric: auc or f1
+  label_mode: multi        # one of [multi, any, column, binary]; auto defaults: multi if labels 2-D else binary
+  # label_column: 0        # required when label_mode=column (0-based index)
 
 # Logging/saving
 logging:

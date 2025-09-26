@@ -62,16 +62,20 @@ class GraphSAGE(nn.Module):
         return self.proj(h)
 
 class LinkPredictor(nn.Module):
-    def __init__(self, in_dim: int, hidden: int):
+    def __init__(self, in_dim: int, hidden: int, out_dim: int = 1):
         super().__init__()
         self.lin1 = nn.Linear(in_dim*2, hidden)
-        self.lin2 = nn.Linear(hidden, 1)
+        self.lin2 = nn.Linear(hidden, out_dim)
+        self.out_dim = out_dim
 
     def forward(self, h, edge_pairs):
         src, dst = edge_pairs
         z = torch.cat([h[src], h[dst]], dim=-1)
         z = F.relu(self.lin1(z))
-        return self.lin2(z).squeeze(-1)
+        out = self.lin2(z)
+        if self.out_dim == 1:
+            return out.squeeze(-1)
+        return out  # (B, out_dim)
 
 # ---------------- Utilities ---------------- #
 
@@ -142,14 +146,30 @@ def evaluate(model_g, model_lp, x, edge_pairs, labels, device, edge_index_global
     with torch.no_grad():
         h = model_g(x, edge_index_global)
         logits = model_lp(h, torch.as_tensor(edge_pairs.T, dtype=torch.long, device=device))
-        probs = torch.sigmoid(logits).cpu().numpy()
-        preds = (probs >= 0.5).astype(int)
-        f1 = f1_score(labels, preds, average='micro')
-        try:
-            auc = roc_auc_score(labels, probs)
-        except ValueError:
-            auc = float('nan')
-        acc = (preds == labels).mean()
+        if logits.ndim == 1:  # binary
+            probs = torch.sigmoid(logits).cpu().numpy()
+            preds = (probs >= 0.5).astype(int)
+            f1 = f1_score(labels, preds, average='micro')
+            try:
+                auc = roc_auc_score(labels, probs)
+            except ValueError:
+                auc = float('nan')
+            acc = (preds == labels).mean()
+        else:  # multi-label
+            probs = torch.sigmoid(logits).cpu().numpy()  # (N, C)
+            preds = (probs >= 0.5).astype(int)
+            f1 = f1_score(labels, preds, average='micro', zero_division=0)
+            # AUC macro over classes (ignore errors if class constant)
+            auc_list = []
+            for c in range(probs.shape[1]):
+                y_c = labels[:, c]
+                if len(np.unique(y_c)) > 1:
+                    try:
+                        auc_list.append(roc_auc_score(y_c, probs[:, c]))
+                    except ValueError:
+                        pass
+            auc = float(np.mean(auc_list)) if auc_list else float('nan')
+            acc = (preds == labels).mean()
     return f1, auc, acc
 
 # ---------------- Main Train ---------------- #
@@ -169,6 +189,42 @@ def train(cfg: Config, root: str):
     val_edges = edge_pairs[val_idx]; val_labels = edge_labels[val_idx]
     test_edges = edge_pairs[test_idx]; test_labels = edge_labels[test_idx]
 
+    # -------- Label Mode Handling --------
+    # Original shape could be (N,) or (N,C) where C=7 for your dataset.
+    original_shape = edge_labels.shape
+    if edge_labels.ndim == 1:
+        label_mode = cfg.train.get('label_mode', 'binary')
+    else:
+        label_mode = cfg.train.get('label_mode', 'multi')
+
+    def _apply_mode(arr):
+        if label_mode == 'multi':
+            return arr
+        elif label_mode == 'any':
+            return (arr.max(axis=1) > 0).astype(int)
+        elif label_mode == 'column':
+            col = cfg.train.get('label_column', 0)
+            if col < 0 or col >= arr.shape[1]:
+                raise ValueError(f'label_column {col} out of range 0..{arr.shape[1]-1}')
+            return arr[:, col]
+        elif label_mode == 'binary':
+            if arr.ndim != 1:
+                raise ValueError('label_mode=binary but labels provided are multi-dimensional.')
+            return arr
+        else:
+            raise ValueError(f'Unknown label_mode {label_mode}')
+
+    # Apply to each split label set (only if multi-dim or required)
+    if train_labels.ndim == 2 or label_mode in ('any','column'):
+        train_labels = _apply_mode(train_labels)
+        val_labels = _apply_mode(val_labels)
+        test_labels = _apply_mode(test_labels)
+
+    if train_labels.ndim == 1:
+        out_dim = 1
+    else:
+        out_dim = train_labels.shape[1]
+
     # Build global graph
     if cfg.train.get('inductive', True):
         base_edges = train_edges
@@ -179,7 +235,7 @@ def train(cfg: Config, root: str):
     edge_index_global = edge_index_from_pairs(num_nodes, base_edges).to(device)
 
     model_g = GraphSAGE(feat_dim, cfg.model['hidden_dim'], cfg.model['sage_layers'], cfg.model['dropout']).to(device)
-    model_lp = LinkPredictor(cfg.model['hidden_dim'], cfg.model['link_hidden']).to(device)
+    model_lp = LinkPredictor(cfg.model['hidden_dim'], cfg.model['link_hidden'], out_dim=out_dim).to(device)
 
     opt = torch.optim.Adam(list(model_g.parameters()) + list(model_lp.parameters()), lr=cfg.optim['lr'])
     loss_fn = nn.BCEWithLogitsLoss()
@@ -229,7 +285,10 @@ def train(cfg: Config, root: str):
         model_lp.load_state_dict(best_state['model_lp'])
 
     test_f1, test_auc, test_acc = evaluate(model_g, model_lp, x, test_edges, test_labels, device, edge_index_global)
-    print(f"Test micro-F1: {test_f1:.4f} | Test AUC: {test_auc:.4f} | Test Acc: {test_acc:.4f}")
+    print(f"Label original shape: {original_shape}; mode={label_mode}; final_train_shape={train_labels.shape}")
+    if out_dim > 1:
+        print("(Multi-label setting) AUC=macro over valid columns; micro-F1 over all (edge,class) pairs")
+    print(f"Test micro-F1: {test_f1:.4f} | Test AUC(avg): {test_auc:.4f} | Test Acc(elem-wise): {test_acc:.4f}")
 
     out_dir = os.path.join(root, cfg.output_dir, cfg.dataset, cfg.split)
     os.makedirs(out_dir, exist_ok=True)
@@ -251,6 +310,11 @@ def train(cfg: Config, root: str):
         test_logits = model_lp(h_full, torch.as_tensor(test_edges.T, dtype=torch.long, device=device))
         test_probs = torch.sigmoid(test_logits).cpu().numpy()
     np.save(os.path.join(out_dir, 'predictions_test.npy'), test_probs)
+    if out_dim > 1:
+        # Save split labels for further per-class analysis downstream
+        np.save(os.path.join(out_dir, 'train_labels.npy'), train_labels)
+        np.save(os.path.join(out_dir, 'val_labels.npy'), val_labels)
+        np.save(os.path.join(out_dir, 'test_labels.npy'), test_labels)
 
 
 def main():
